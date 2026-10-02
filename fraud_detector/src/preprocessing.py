@@ -2,6 +2,8 @@
 import pandas as pd
 import numpy as np
 import logging
+import os
+from pathlib import Path
 
 # Import extra modules
 from geopy.distance import great_circle
@@ -9,6 +11,7 @@ from sklearn.impute import SimpleImputer
 
 logger = logging.getLogger(__name__)
 RANDOM_STATE = 42
+DEFAULT_TRAIN_PATH = Path(__file__).resolve().parents[1] / 'train_data/train.csv'
 
 def add_time_features(df):
     logger.debug('Adding time features...')
@@ -23,11 +26,10 @@ def add_time_features(df):
     return df
 
 
-def cat_encode(train, input_df, col):
+def cat_encode(preprocessor, input_df, col):
     
     logger.debug('Encoding category: %s', col)
-    new_col = col + '_cat'
-    mapping = train[[col, new_col]].drop_duplicates()
+    mapping = preprocessor.category_maps[col]
     
     # Merge to initial dataset
     input_df = input_df.merge(mapping, how='left', on=col).drop(columns=col)
@@ -49,7 +51,7 @@ def add_distance_features(df):
 
 
 # Calculate means for encoding at docker container start
-def load_train_data():
+def load_train_data(path=None):
 
     logger.info('Loading training data...')
 
@@ -59,7 +61,8 @@ def load_train_data():
     n_cats = 50
 
     # Import Train dataset
-    train = pd.read_csv('./train_data/train.csv').drop(columns=['name_1', 'name_2', 'street', 'post_code'])
+    path = path or os.getenv('TRAIN_DATA_PATH', str(DEFAULT_TRAIN_PATH))
+    train = pd.read_csv(path).drop(columns=['name_1', 'name_2', 'street', 'post_code'])
     logger.info('Raw train data imported. Shape: %s', train.shape)
 
     # Add some simple time features
@@ -90,18 +93,19 @@ def load_train_data():
 
 
 # Main preprocessing function
-def run_preproc(train, input_df):
+def run_preproc(preprocessor, input_df):
 
     # Define column types
     target_col = 'target'
     categorical_cols = ['gender', 'merch', 'cat_id', 'one_city', 'us_state', 'jobs']
     continuous_cols = ['amount', 'population_city']
     drop_col = ['name_1', 'name_2', 'street', 'post_code']
-    input_df = input_df.drop(columns=drop_col)
+    input_df = validate_input(input_df)
+    input_df = input_df.drop(columns=drop_col, errors='ignore')
     
     # Run category encoding
     for col in categorical_cols:
-        input_df = cat_encode(train, input_df, col)
+        input_df = cat_encode(preprocessor, input_df, col)
 
     logger.info('Categorical merging completed. Output shape: %s', input_df.shape)
     
@@ -118,9 +122,8 @@ def run_preproc(train, input_df):
         # Fill empty values of categorical columns with some default category
         input_df[col] = input_df[col].fillna('cat_NAN')
     
-        # Create table of means
-        means_tb = train.groupby(col)[[target_col]].mean()\
-                        .reset_index().rename(columns={target_col:f'{col}_mean_enc'})
+        # Get table of means
+        means_tb = preprocessor.mean_maps[col]
         
         # Join to datasets
         input_df = input_df.merge(means_tb, how='left', on=col)
@@ -132,8 +135,7 @@ def run_preproc(train, input_df):
     continuous_cols.extend(['distance'])
 
     # Impute empty values with mean value
-    imputer = SimpleImputer(missing_values=np.nan, strategy='mean') 
-    imputer = imputer.fit(train[continuous_cols])
+    imputer = preprocessor.imputer
 
     output_df = pd.concat([
         input_df.drop(columns=continuous_cols),
@@ -149,3 +151,65 @@ def run_preproc(train, input_df):
     
     # Return resulting dataset
     return output_df
+
+class Preprocessor:
+    def __init__(self, train):
+        target_col = 'target'
+        categorical_cols = ['gender', 'merch', 'cat_id', 'one_city', 'us_state', 'jobs']
+        continuous_cols = ['amount', 'population_city', 'distance']
+
+        # Сохраняем таблицы категорий
+        self.category_maps = {}
+        for col in categorical_cols:
+            new_col = col + '_cat'
+            mapping = train[[col, new_col]].drop_duplicates()
+            self.category_maps[col] = mapping
+
+        categorical_cols = [x + '_cat' for x in categorical_cols]
+        categorical_cols.extend(['hour', 'year', 'month', 'day_of_month', 'day_of_week'])
+
+        # Сохраняем таблицы среднего target
+        self.mean_maps = {}
+        for col in categorical_cols:
+            # Create table of means
+            means_tb = train.groupby(col)[[target_col]].mean()\
+                            .reset_index().rename(columns={target_col:f'{col}_mean_enc'})
+            self.mean_maps[col] = means_tb
+
+        # Рассчитываем средние значения для заполнения пропусков
+        imputer = SimpleImputer(missing_values=np.nan, strategy='mean')
+        imputer = imputer.fit(train[continuous_cols])
+        self.imputer = imputer
+        logger.info('Preprocessing statistics ready (%s reference rows)', len(train))
+
+    def transform(self, input_df):
+        return run_preproc(self, input_df)
+
+
+def validate_input(input_df):
+    # Проверяем обязательные поля транзакции
+    required_cols = [
+        'transaction_time', 'gender', 'merch', 'cat_id', 'one_city', 'us_state',
+        'jobs', 'amount', 'population_city', 'lat', 'lon', 'merchant_lat', 'merchant_lon',
+    ]
+    missing = set(required_cols) - set(input_df.columns)
+    if missing:
+        raise ValueError(f'Missing transaction fields: {sorted(missing)}')
+    if input_df.empty:
+        raise ValueError('Empty transaction batch')
+    if input_df['transaction_time'].isna().any():
+        raise ValueError('transaction_time is required')
+
+    # Проверяем числовые значения и координаты
+    input_df = input_df.copy()
+    for col in ['amount', 'population_city', 'lat', 'lon', 'merchant_lat', 'merchant_lon']:
+        input_df[col] = pd.to_numeric(input_df[col], errors='raise')
+        if np.isinf(input_df[col]).any():
+            raise ValueError(f'{col} must be finite')
+    for col in ['amount', 'population_city']:
+        if (input_df[col] < 0).any():
+            raise ValueError(f'{col} must be nonnegative')
+    for col, limit in [('lat', 90), ('lon', 180), ('merchant_lat', 90), ('merchant_lon', 180)]:
+        if input_df[col].isna().any() or (input_df[col].abs() > limit).any():
+            raise ValueError(f'Invalid coordinate: {col}')
+    return input_df

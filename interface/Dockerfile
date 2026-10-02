@@ -1,11 +1,12 @@
-FROM python:3.9-slim
+FROM python:3.12-slim
 
 WORKDIR /app
+ENV PYTHONUNBUFFERED=1
 
-# Создаем директорию для конфига
+# Создаем папку для настроек Streamlit
 RUN mkdir -p /root/.streamlit
 
-# Копируем конфигурационный файл
+# Копируем настройки Streamlit
 COPY .streamlit/config.toml /root/.streamlit/config.toml
 
 COPY requirements.txt .
